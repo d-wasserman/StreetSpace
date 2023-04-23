@@ -23,7 +23,9 @@ from rtree import index
 from itertools import cycle, groupby
 from pprint import pprint
 from time import time
-from scipy.spatial import cKDTree  
+from scipy.spatial import cKDTree
+from sklearn.neighbors import BallTree  
+from warnings import warn
 
 from .utils import *
 
@@ -456,8 +458,13 @@ def spaced_points_along_line(linestring, spacing, centered=False, return_lin_ref
         return all_points, all_lin_refs
 
 
-def azimuth(linestring, degrees=True):
+def azimuth(linestring, degrees=True, warning=True):
     """Calculate azimuth between endpoints of a LineString.
+
+    
+    ###### WARNING: This function was returning reversed azimuths in an earlier version.
+    ###### Code depending on it should be reviewed for logic errors. 
+
 
     Parameters
     ----------
@@ -473,9 +480,10 @@ def azimuth(linestring, degrees=True):
     :obj:`float`
         Azimuth between the endpoints of the ``linestring``.
     """ 
-    u = endpoints(linestring)[0]
-    v = endpoints(linestring)[1]
-    azimuth = np.arctan2(u.y - v.y, u.x - v.x)
+    if warning:
+        warn('A previous version of streetspace.geometry.azimuth returned reverse azimuths 180 degree off')
+    u, v = endpoints(linestring)
+    azimuth = np.arctan2(v.y - u.y, v.x - u.x)
     if degrees:
         return np.degrees(azimuth)
     else:
@@ -649,7 +657,7 @@ def gdf_spaced_points_along_lines(gdf, spacing, centered=False, return_lin_refs=
     return points_gdf
 
 
-def gdf_split_lines(gdf, segment_length, centered = False, min_length = 0):
+def gdf_split_lines(gdf, segment_length, centered = False, min_length = 0, return_lin_refs=False):
     """Split LineStrings in a GeoDataFrame into equal-length segments.
 
     Attributes in accompanying columns are copied to all children of each
@@ -677,12 +685,15 @@ def gdf_split_lines(gdf, segment_length, centered = False, min_length = 0):
         centered = 'space'
 
     # initiate new dataframe to hold segments
-    segments = gpd.GeoDataFrame(data=None, columns=gdf.columns, 
-                                geometry = 'geometry', crs=gdf.crs)
+    # segments = gpd.GeoDataFrame(data=None, columns=gdf.columns, 
+    #                             geometry = 'geometry', crs=gdf.crs)
+    segments = []
+
     for i, segment in gdf.iterrows():
-        points = spaced_points_along_line(segment['geometry'], 
+        points, lin_refs = spaced_points_along_line(segment['geometry'], 
                                           segment_length, 
-                                          centered = centered)
+                                          centered = centered,
+                                          return_lin_refs=True)
         points = points[1:] # exclude the starting point
         # cut the segment at each point
         segment_geometries = split_line_at_points(segment['geometry'], points)
@@ -701,11 +712,16 @@ def gdf_split_lines(gdf, segment_length, centered = False, min_length = 0):
         segment_records = gpd.GeoDataFrame(
             data=[segment]*len(segment_geometries), columns=gdf.columns, 
             geometry = 'geometry', crs=gdf.crs)
+        if return_lin_refs:
+            segment_records['lin_ref'] = lin_refs
         # replace the geometry for these copied records with the segment geometry
         segment_records['geometry'] = segment_geometries
         # add new segments to full list
-        segments = segments.append(segment_records, ignore_index=True)
-    return segments
+        # segments = segments.append(segment_records, ignore_index=True)
+        segments.append(segment_records)
+    
+    # return segments
+    return pd.concat(segments, axis=0, ignore_index=True)
 
 
 def gdf_bbox(gdf):
@@ -1104,6 +1120,9 @@ def label_features(axis, gdf, label_column, offset, **kwargs):
                 jitter_range = max([(maxx-minx),(maxy-miny)]) * jitter
                 x = label_point.x + random.uniform(-jitter_range, jitter_range)
                 y = label_point.y + random.uniform(-jitter_range, jitter_range)
+            else:
+                x = label_point.x
+                y = label_point.y
             return Point(x,y)
 
     gdf.apply(lambda edge: axis.annotate(s=edge[label_column], 
@@ -1112,14 +1131,15 @@ def label_features(axis, gdf, label_column, offset, **kwargs):
         **kwargs), axis=1)
 
 def plot_shapes(shapes, ax=None, axis_off=True, size=8, extent=None, 
-    legend=None, leaflet=False):
+    legend=None, base_shapes=None, leaflet=False):
     """Plot multiple shapes.
 
     Parameters
     ----------
-    shapes : list or Shapely geometry
+    shapes : single Shapely geometry, list of geometries, list of lists of geometries, GeoDataFrame, or list of GeoDataFrames
         * a single geometry will be plotted by itself
-        * each geometry in a list will be plotted in a seperate color
+        * each geometry or list of geometries within a list will be plotted in a seperate color
+        * all records in a GeoDataFrame will be plotted in the same color
         * tuples like (geom, {'color':'color'}) may be passed to specify colors\
         and other attributes
         * default color order is: brgcmyk
@@ -1142,7 +1162,11 @@ def plot_shapes(shapes, ax=None, axis_off=True, size=8, extent=None,
     legend : :obj:`list`, optional, default = ``None``
         List with the same length and order as ``shapes``
 
-    leaflet : :obj:`bool`, optional, default = ``False``
+    base_shapes : GeoDataFrame
+        If specified, extents of `base_shapes` will be clipped to the maximum extent of `shapes` 
+        and plotted as the bottom layer in grey 
+
+    leaflet : :obj:`bool`, optional, default = ``False`` (deprecated)
         * ``True`` : will plot in leaflet in a new browser window
         * ``False`` : will plot normally in-line
     """
@@ -1204,34 +1228,55 @@ def plot_shapes(shapes, ax=None, axis_off=True, size=8, extent=None,
         max_extent = max([(maxx-minx),(maxy-miny)])
         offset = max_extent / 120
 
-    # Plot the first shape
+    # Set up axis
     if not ax:
         if not isinstance(size, tuple):
             size = (size, size)
         fig, ax = plt.subplots(1, figsize=size)
-    first_shape = shapes[0]
-    first_shape.plot(ax=ax, color=colors[0], alpha=alphas[0])
-    if labels[0]:
-        if not labels[0] in first_shape.columns:
-            first_shape[labels[0]] = labels[0]
-        label_features(
-            ax, first_shape, labels[0], (offset,offset), color=colors[0], ha='left')
 
-    # plot remaining shapes
-    if len(shapes) > 0:
-        remaining_shapes = shapes[1:]
-        for i, shape in enumerate(remaining_shapes):
-            shape.plot(ax=ax, color=colors[i+1], alpha=alphas[i+1])
-            if labels[i+1]:
-                if not labels[i+1] in shape.columns:
-                    shape[labels[i+1]] = labels[i+1]
-                label_features(
-                    ax, shape, labels[i+1], (offset,offset), color=colors[i+1], ha='left')
+    # Plot base shapes if specified
+    if base_shapes is not None:
+        if isinstance(base_shapes, list):
+            base_shapes = gpd.GeoDataFrame(geometry=base_shapes)
+        # Calculate bounding box of primary shapes
+        bbox = gdf_bbox(gpd.GeoDataFrame(geometry=[geom for shape in shapes for geom in shape.geometry]))
+        # Get intersection of bbox with base shapes
+        base_shapes = gpd.overlay(base_shapes, gpd.GeoDataFrame(geometry=[bbox], crs=base_shapes.crs))
+        # Plot the base shapes
+        base_shapes.plot(ax=ax, color='#ECECEC')
+
+    # Plot shapes
+    for i, shape in enumerate(shapes):
+        shape.plot(ax=ax, color=colors[i], alpha=alphas[i])
+        if labels[i]:
+            if not labels[i] in shape.columns:
+                shape[labels[i]] = labels[i]
+            label_features(
+                ax, shape, labels[i], (offset,offset), color=colors[i], ha='left')
+
+    # 
+    # first_shape = shapes[0]
+    # first_shape.plot(ax=ax, color=colors[0], alpha=alphas[0])
+    # if labels[0]:
+    #     if not labels[0] in first_shape.columns:
+    #         first_shape[labels[0]] = labels[0]
+    #     label_features(
+    #         ax, first_shape, labels[0], (offset,offset), color=colors[0], ha='left')
+
+    # # plot remaining shapes
+    # if len(shapes) > 0:
+    #     remaining_shapes = shapes[1:]
+    #     for i, shape in enumerate(remaining_shapes):
+    #         shape.plot(ax=ax, color=colors[i+1], alpha=alphas[i+1])
+    #         if labels[i+1]:
+    #             if not labels[i+1] in shape.columns:
+    #                 shape[labels[i+1]] = labels[i+1]
+    #             label_features(
+    #                 ax, shape, labels[i+1], (offset,offset), color=colors[i+1], ha='left')
     
     if leaflet:
-        mplleaflet.show(fig=fig, crs=shapes[0].crs, tiles='cartodb_positron')
-    
-    else:
+        mplleaflet.show(fig=fig, crs=shapes[0].crs, tiles='cartodb_positron')       
+
         if extent:
             ax.axis('equal')
             minx, miny, maxx, maxy = extent
@@ -1705,22 +1750,22 @@ def construct_hexagons(startx, starty, endx, endy, radius):
 
 
 def hexagon_grid(gdf, radius):
-	"""Create mesh of hexagons with a specific radius across the same extent as a gdf
+    """Create mesh of hexagons with a specific radius across the same extent as a gdf
 
-	"""
-	# get bounds of supplied geodataframe
-	minx, miny, maxx, maxy = gdf.total_bounds
+    """
+    # get bounds of supplied geodataframe
+    minx, miny, maxx, maxy = gdf.total_bounds
 
-	# calculate coordinates for hexagons
-	hex_coords = construct_hexagons(minx, miny, maxx, maxy, radius)
+    # calculate coordinates for hexagons
+    hex_coords = construct_hexagons(minx, miny, maxx, maxy, radius)
 
-	# construct hexagon polygons
-	hexagons = [sh.geometry.Polygon(coords) for coords in hex_coords]
+    # construct hexagon polygons
+    hexagons = [sh.geometry.Polygon(coords) for coords in hex_coords]
 
-	# convert to geodataframe
-	hexagons = gpd.GeoDataFrame(geometry=hexagons, crs=gdf.crs) 
+    # convert to geodataframe
+    hexagons = gpd.GeoDataFrame(geometry=hexagons, crs=gdf.crs) 
 
-	return hexagons
+    return hexagons
 
 
 def merge_multilinestring(multilinestring, tolerance):
@@ -1855,7 +1900,7 @@ def quadrat_cut_gdf(gdf, width):
     return gdf
 
 
-def identify_nearest_points(gdf_a, gdf_b, b_column, merge_original=False):
+def identify_nearest_points(gdf_a, gdf_b, b_column=None, dist_as_int=True, merge_original=False):
     """Identify the nearest point in `gdf_b` for each point in `gdf_a`.
 
     Value in `b_column` is reported for each row in `gdf_a`.
@@ -1866,14 +1911,20 @@ def identify_nearest_points(gdf_a, gdf_b, b_column, merge_original=False):
     nB = np.array(list(zip(gdf_b.geometry.x, gdf_b.geometry.y)) )
     btree = cKDTree(nB)
     dist, idx = btree.query(nA,k=1)
-    df = pd.DataFrame.from_dict(
-        {
-            'distance': dist.astype(int),
-            b_column : gdf_b.loc[idx, b_column].values
-        })
+    if dist_as_int:
+        dist = dist.astype(int)
+    cols = {'distance': dist}
+    if b_column:
+        cols[b_column] = gdf_b.loc[idx, b_column].values
+
+    df = pd.DataFrame.from_dict(cols)
     if merge_original:
         df = gdf_a.merge(df, left_index=True, right_index=True)
-    return df
+    # Return as a series if there's only one column
+    if len(df.columns) == 1:
+        return df.distance
+    else:
+        return df
 
 
 def aerial_count_interpolation(source_gdf, count_field, dest_gdf):
@@ -1947,4 +1998,110 @@ def gdf_3d_to_2d(gdf):
     gdf.geometry = new_geo
     return gdf
 
+def gdf_cast_singlpart_geometry_to_multipart(gdf, geometry_column='geometry'):
+    '''Convert any singlepart geometries in a mixed-type geodataframe to multipart.
 
+    Based on https://stackoverflow.com/questions/7571635/fastest-way-to-check-if-a-value-exists-in-a-list
+    '''
+    gdf = gdf.copy()
+    if type(gdf.iloc[0][geometry_column]) in [Point, MultiPoint]:
+        gdf[geometry_column] = [MultiPoint([feature]) if type(feature) == Point else feature for feature in gdf[geometry_column]]
+    elif type(gdf.iloc[0][geometry_column]) in [LineString, MultiLineString]:
+        gdf[geometry_column] = [MultiLineString([feature]) if type(feature) == LineString else feature for feature in gdf[geometry_column]]
+    elif type(gdf.iloc[0][geometry_column]) in [Polygon, MultiPolygon]:
+        gdf[geometry_column] = [MultiPolygon([feature]) if type(feature) == Polygon else feature for feature in gdf[geometry_column]]
+    return gdf
+
+
+def intersection_of_lines_vectorized(line_a_start, line_a_end, line_b_start, line_b_end, constrain_on_a=True, constrain_on_b=True):
+    def line_intersect(a1, a2, b1, b2):
+        """
+        From https://www.py4u.net/discuss/15536
+        """
+        T = np.array([[0, -1], [1, 0]])
+        da = np.atleast_2d(a2 - a1)
+        db = np.atleast_2d(b2 - b1)
+        dp = np.atleast_2d(a1 - b1)
+        dap = np.dot(da, T)
+        denom = np.sum(dap * db, axis=1)
+        num = np.sum(dap * dp, axis=1)
+        # Ignore dividing by 0 and multiplying by nan
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return np.atleast_2d(num / denom).T * db + b1
+
+    intersections = line_intersect(line_a_start, line_a_end, line_b_start, line_b_end)
+    intersections = pd.DataFrame(intersections).rename(columns={0:'x',1:'y'})
+
+    # Remove cases where the intersection isn't on line a or b
+    if constrain_on_a or constrain_on_b:
+        # Add line start and end coordinates to the dataframe
+        intersections = pd.concat([
+            intersections,
+            pd.DataFrame(line_a_start, columns=['line_a_start_x', 'line_a_start_y']),
+            pd.DataFrame(line_a_end, columns=['line_a_end_x', 'line_a_end_y']),
+            pd.DataFrame(line_b_start, columns=['line_b_start_x', 'line_b_start_y']),
+            pd.DataFrame(line_b_end, columns=['line_b_end_x', 'line_b_end_y']),
+        ], axis=1)
+
+        if constrain_on_a:
+            intersections = intersections[
+                (intersections.x >= intersections[['line_a_start_x','line_a_end_x']].min(axis=1)) & 
+                (intersections.x <= intersections[['line_a_start_x','line_a_end_x']].max(axis=1)) & 
+                (intersections.y >= intersections[['line_a_start_y','line_a_end_y']].min(axis=1)) & 
+                (intersections.y <= intersections[['line_a_start_y','line_a_end_y']].max(axis=1))].copy()
+
+        if constrain_on_b:
+            intersections = intersections[
+                (intersections.x >= intersections[['line_b_start_x','line_b_end_x']].min(axis=1)) & 
+                (intersections.x <= intersections[['line_b_start_x','line_b_end_x']].max(axis=1)) & 
+                (intersections.y >= intersections[['line_b_start_y','line_b_end_y']].min(axis=1)) & 
+                (intersections.y <= intersections[['line_b_start_y','line_b_end_y']].max(axis=1))].copy()
+
+    return intersections[['x','y']]
+            
+
+def get_nearest(src_points, candidates, k_neighbors):
+    """
+    Find nearest neighbors for all source points from a set of candidate points
+    Adapted from https://stackoverflow.com/questions/62198199/k-nearest-points-from-two-dataframes-with-geopandas
+    """
+
+    # Create tree from the candidate points
+    tree = BallTree(candidates, leaf_size=15)
+
+    # Find closest points and distances
+    distances, indices = tree.query(src_points, k=k_neighbors)
+   
+    return (indices, distances)
+
+
+def nearest_neighbor(left_gdf, right_gdf, k_neighbors=1, return_left_columns=True, return_right_columns=True):
+    """
+    For each point in left_gdf, find closest point in right GeoDataFrame and return them.
+    Adapted from https://stackoverflow.com/questions/62198199/k-nearest-points-from-two-dataframes-with-geopandas
+    """
+    # Ensure that index in right gdf is formed of sequential numbers
+    right = right_gdf.copy().reset_index(drop=True)
+    
+    left_coords = np.array(list(zip(left_gdf[left_gdf.geometry.name].x, left_gdf[left_gdf.geometry.name].y)))
+    right_coords = np.array(list(zip(right[right_gdf.geometry.name].x, right[right_gdf.geometry.name].y)))
+
+    # Find the nearest points
+    # -----------------------
+    # closest ==> index in right_gdf that corresponds to the closest point
+    # dist ==> distance between the nearest neighbors (in meters)
+
+    closest, dist = get_nearest(src_points=left_coords, candidates=right_coords, k_neighbors=k_neighbors)
+   
+    closest = pd.DataFrame({'right_index':[list(x) for x in closest]}).explode('right_index')
+    dist = pd.DataFrame({'right_dist':[list(x) for x in dist]}).explode('right_dist')
+    closest = pd.concat([closest, dist], axis=1).reset_index().rename(columns={'index':'left_index'})
+    
+    if return_left_columns:
+        closest = left_gdf.merge(closest, left_index=True, right_on='left_index', how='left').reset_index(drop=True)
+    if return_right_columns:
+        closest = closest.merge(right.drop(columns=[right_gdf.geometry.name]), left_on='right_index', right_index=True).reset_index(drop=True)
+        
+    closest = closest.sort_values('left_index').reset_index()
+    
+    return closest
